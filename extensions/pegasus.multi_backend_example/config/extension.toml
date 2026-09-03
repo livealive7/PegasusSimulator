@@ -1,0 +1,14 @@
+[package]
+version = "0.1.0"
+title = "Multi Backend Drone Spawner (Example)"
+description = "easy extension：one button，spawn ArduPilot+ROS2 backend Multirotor"
+authors = ["LIVEALIVE"]
+category = "Example"
+
+[dependencies]
+"omni.kit.uiapp" = {}
+# 需要Pegasus Simulator extension已經啟用，才吃得到 pegasus.simulator.* 模組
+"pegasus.simulator" = {}
+
+[[python.module]]
+name = "pegasus.multi_backend_example"

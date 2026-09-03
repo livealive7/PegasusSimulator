@@ -3,9 +3,14 @@
 | Author: Marcelo Jacinto (marcelo.jacinto@tecnico.ulisboa.pt)
 | Description: File that implements the ROS2 Backend for communication/control with/of the vehicle simulation through ROS2 topics
 | License: BSD-3-Clause. Copyright (c) 2024, Marcelo Jacinto. All rights reserved.
+|
+| NOTE (patched): all numeric fields written into ROS2 messages are now wrapped in float()
+| to avoid `PyFloat_Check` assertion crashes when the underlying Pegasus State/data values
+| are numpy scalars (numpy.float32/float64) instead of native Python floats.
 """
 
 # Make sure the ROS2 extension is enabled
+import threading
 import carb
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.ros2.bridge")
@@ -71,6 +76,18 @@ class ROS2Backend(Backend):
             >>>  "pub_state": True,                             # Publish the state of the vehicle
             >>>  "pub_tf": False,                               # Publish the TF of the vehicle
             >>>  "sub_control": True,                           # Subscribe to the control topics
+            >>>  "state_pub_divisor": 1,                        # Only actually publish state on every Nth physics step (1 = every step)
+            >>>  "sensor_pub_divisor": 1,                       # Only actually publish sensor data on every Nth physics step (1 = every step)
+
+        Note:
+            `rclpy.spin_once` is polled from a dedicated background thread (started in `start()`, stopped in
+            `stop()`) instead of being called synchronously from `update()` on every physics step. Polling it
+            from the physics-step callback was measured (via py-spy) to cost ~20% of total simulation wall-clock
+            time, because the DDS wait-set check inside `wait_for_ready_callbacks` has real overhead per call
+            even with `timeout_sec=0`, and `update()` was calling it at the full physics rate (hundreds of Hz).
+            `state_pub_divisor`/`sensor_pub_divisor` let you additionally cut down how often messages are
+            actually built and published, since most ROS2 consumers don't need state/sensor data at the full
+            physics rate either.
         """
 
         # Save the configurations for this backend
@@ -86,6 +103,18 @@ class ROS2Backend(Backend):
 
         # Check if the tf2_ros library is loaded and if the flag is set to True
         self._pub_tf = config.get("pub_tf", False) and tf2_ros_loaded
+
+        # How many physics steps to skip between actually building/publishing state and sensor messages.
+        # 1 = publish every physics step (default, matches previous behavior).
+        self._state_pub_divisor = max(1, int(config.get("state_pub_divisor", 1)))
+        self._sensor_pub_divisor = max(1, int(config.get("sensor_pub_divisor", 1)))
+        self._state_pub_counter = 0
+        self._sensor_pub_counters = {}
+
+        # Background thread that polls rclpy for incoming messages, so that the physics-step callback
+        # (update()) doesn't have to pay the DDS wait-set polling cost of rclpy.spin_once() on every step.
+        self._spin_thread = None
+        self._spin_stop_event = threading.Event()
 
         # Start the actual ROS2 setup here
         try:
@@ -214,6 +243,11 @@ class ROS2Backend(Backend):
         if not self._pub_state:
             return
 
+        # Throttle: only actually build/publish on every Nth call
+        self._state_pub_counter += 1
+        if self._state_pub_counter % self._state_pub_divisor != 0:
+            return
+
         pose = PoseStamped()
         twist = TwistStamped()
         twist_inertial = TwistStamped()
@@ -231,33 +265,36 @@ class ROS2Backend(Backend):
         accel.header.frame_id = "map"
 
         # Fill the position and attitude of the vehicle in ENU
-        pose.pose.position.x = state.position[0]
-        pose.pose.position.y = state.position[1]
-        pose.pose.position.z = state.position[2]
+        # NOTE: wrapped in float() - state.position/attitude are numpy arrays, and
+        # rosidl_generator_py's PyFloat_Check() rejects numpy scalar types, causing
+        # a native crash (Assertion `PyFloat_Check(field)' failed.) if not converted.
+        pose.pose.position.x = float(state.position[0])
+        pose.pose.position.y = float(state.position[1])
+        pose.pose.position.z = float(state.position[2])
 
-        pose.pose.orientation.x = state.attitude[0]
-        pose.pose.orientation.y = state.attitude[1]
-        pose.pose.orientation.z = state.attitude[2]
-        pose.pose.orientation.w = state.attitude[3]
+        pose.pose.orientation.x = float(state.attitude[0])
+        pose.pose.orientation.y = float(state.attitude[1])
+        pose.pose.orientation.z = float(state.attitude[2])
+        pose.pose.orientation.w = float(state.attitude[3])
 
         # Fill the linear and angular velocities in the body frame of the vehicle
-        twist.twist.linear.x = state.linear_body_velocity[0]
-        twist.twist.linear.y = state.linear_body_velocity[1]
-        twist.twist.linear.z = state.linear_body_velocity[2]
+        twist.twist.linear.x = float(state.linear_body_velocity[0])
+        twist.twist.linear.y = float(state.linear_body_velocity[1])
+        twist.twist.linear.z = float(state.linear_body_velocity[2])
 
-        twist.twist.angular.x = state.angular_velocity[0]
-        twist.twist.angular.y = state.angular_velocity[1]
-        twist.twist.angular.z = state.angular_velocity[2]
+        twist.twist.angular.x = float(state.angular_velocity[0])
+        twist.twist.angular.y = float(state.angular_velocity[1])
+        twist.twist.angular.z = float(state.angular_velocity[2])
 
         # Fill the linear velocity of the vehicle in the inertial frame
-        twist_inertial.twist.linear.x = state.linear_velocity[0]
-        twist_inertial.twist.linear.y = state.linear_velocity[1]
-        twist_inertial.twist.linear.z = state.linear_velocity[2]
+        twist_inertial.twist.linear.x = float(state.linear_velocity[0])
+        twist_inertial.twist.linear.y = float(state.linear_velocity[1])
+        twist_inertial.twist.linear.z = float(state.linear_velocity[2])
 
         # Fill the linear acceleration in the inertial frame
-        accel.accel.linear.x = state.linear_acceleration[0]
-        accel.accel.linear.y = state.linear_acceleration[1]
-        accel.accel.linear.z = state.linear_acceleration[2]
+        accel.accel.linear.x = float(state.linear_acceleration[0])
+        accel.accel.linear.y = float(state.linear_acceleration[1])
+        accel.accel.linear.z = float(state.linear_acceleration[2])
 
         # Publish the messages containing the state of the vehicle
         self.pose_pub.publish(pose)
@@ -271,15 +308,14 @@ class ROS2Backend(Backend):
             t.header.stamp = pose.header.stamp
             t.header.frame_id = "map"
             t.child_frame_id = self._namespace + '_' + 'base_link'
-            t.transform.translation.x = state.position[0]
-            t.transform.translation.y = state.position[1]
-            t.transform.translation.z = state.position[2]
-            t.transform.rotation.x = state.attitude[0]
-            t.transform.rotation.y = state.attitude[1]
-            t.transform.rotation.z = state.attitude[2]
-            t.transform.rotation.w = state.attitude[3]
+            t.transform.translation.x = float(state.position[0])
+            t.transform.translation.y = float(state.position[1])
+            t.transform.translation.z = float(state.position[2])
+            t.transform.rotation.x = float(state.attitude[0])
+            t.transform.rotation.y = float(state.attitude[1])
+            t.transform.rotation.z = float(state.attitude[2])
+            t.transform.rotation.w = float(state.attitude[3])
             self.tf_broadcaster.sendTransform(t)
-        
 
     def rotor_callback(self, ros_msg: Float64, rotor_id):
         # Update the reference for the rotor of the vehicle
@@ -292,6 +328,12 @@ class ROS2Backend(Backend):
 
         # Only process sensor data if the flag is set to True
         if not self._pub_sensors:
+            return
+
+        # Throttle: only actually build/publish on every Nth call, tracked per sensor type
+        c = self._sensor_pub_counters.get(sensor_type, 0) + 1
+        self._sensor_pub_counters[sensor_type] = c
+        if c % self._sensor_pub_divisor != 0:
             return
 
         if sensor_type == "IMU":
@@ -328,14 +370,15 @@ class ROS2Backend(Backend):
         msg.header.frame_id = self._namespace + '_' + "base_link_frd"
         
         # Update the angular velocity (NED + FRD)
-        msg.angular_velocity.x = data["angular_velocity"][0]
-        msg.angular_velocity.y = data["angular_velocity"][1]
-        msg.angular_velocity.z = data["angular_velocity"][2]
+        # NOTE: wrapped in float() - see comment in update_state()
+        msg.angular_velocity.x = float(data["angular_velocity"][0])
+        msg.angular_velocity.y = float(data["angular_velocity"][1])
+        msg.angular_velocity.z = float(data["angular_velocity"][2])
         
         # Update the linear acceleration (NED)
-        msg.linear_acceleration.x = data["linear_acceleration"][0]
-        msg.linear_acceleration.y = data["linear_acceleration"][1]
-        msg.linear_acceleration.z = data["linear_acceleration"][2]
+        msg.linear_acceleration.x = float(data["linear_acceleration"][0])
+        msg.linear_acceleration.y = float(data["linear_acceleration"][1])
+        msg.linear_acceleration.z = float(data["linear_acceleration"][2])
 
         # Publish the message with the current imu state
         self.imu_pub.publish(msg)
@@ -358,14 +401,15 @@ class ROS2Backend(Backend):
         msg.status = status_msg
 
         # Update the latitude, longitude and altitude
-        msg.latitude = data["latitude"]
-        msg.longitude = data["longitude"]
-        msg.altitude = data["altitude"]
+        # NOTE: wrapped in float() - see comment in update_state()
+        msg.latitude = float(data["latitude"])
+        msg.longitude = float(data["longitude"])
+        msg.altitude = float(data["altitude"])
 
         # Update the velocity of the vehicle measured by the GPS in the inertial frame (NED)
-        msg_vel.twist.linear.x = data["velocity_north"]
-        msg_vel.twist.linear.y = data["velocity_east"]
-        msg_vel.twist.linear.z = data["velocity_down"]
+        msg_vel.twist.linear.x = float(data["velocity_north"])
+        msg_vel.twist.linear.y = float(data["velocity_east"])
+        msg_vel.twist.linear.z = float(data["velocity_down"])
 
         # Publish the message with the current GPS state
         self.gps_pub.publish(msg)
@@ -379,9 +423,10 @@ class ROS2Backend(Backend):
         msg.header.stamp = self.node.get_clock().now().to_msg()
         msg.header.frame_id = "base_link_frd"
 
-        msg.magnetic_field.x = data["magnetic_field"][0]
-        msg.magnetic_field.y = data["magnetic_field"][1]
-        msg.magnetic_field.z = data["magnetic_field"][2]
+        # NOTE: wrapped in float() - see comment in update_state()
+        msg.magnetic_field.x = float(data["magnetic_field"][0])
+        msg.magnetic_field.y = float(data["magnetic_field"][1])
+        msg.magnetic_field.z = float(data["magnetic_field"][2])
 
         # Publish the message with the current magnetic data
         self.mag_pub.publish(msg)
@@ -483,12 +528,17 @@ class ROS2Backend(Backend):
         """
         Method that when implemented, should be used to update the state of the backend and the information being sent/received
         from the communication interface. This method will be called by the simulation on every physics step
-        """
 
-        # In this case, do nothing as we are sending messages as soon as new data arrives from the sensors and state
-        # and updating the reference for the thrusters as soon as receiving from ROS2 topics
-        # Just poll for new ROS 2 messages in a non-blocking way
-        rclpy.spin_once(self.node, timeout_sec=0)
+        Note: incoming ROS2 messages are no longer polled here. A dedicated background thread (see `start()`)
+        calls `rclpy.spin_once()` on its own cadence instead, since polling it synchronously on every physics
+        step was measured to cost ~20% of total simulation wall-clock time.
+        """
+        pass
+
+    def _spin_loop(self):
+        """Background thread target: polls rclpy for incoming messages independently of the physics step."""
+        while not self._spin_stop_event.is_set():
+            rclpy.spin_once(self.node, timeout_sec=0.05)
 
     def start(self):
         """
@@ -497,12 +547,24 @@ class ROS2Backend(Backend):
         # Reset the reference for the thrusters
         self.input_ref = [0.0 for i in range(self._num_rotors)]
 
+        # Start the background thread that polls for incoming ROS2 messages, if not already running
+        if self._spin_thread is None or not self._spin_thread.is_alive():
+            self._spin_stop_event.clear()
+            self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
+            self._spin_thread.start()
+
     def stop(self):
         """
         Method that when implemented should handle the stopping of the simulation of vehicle
         """
         # Reset the reference for the thrusters
         self.input_ref = [0.0 for i in range(self._num_rotors)]
+
+        # Stop the background ROS2 spin thread
+        self._spin_stop_event.set()
+        if self._spin_thread is not None:
+            self._spin_thread.join(timeout=1.0)
+            self._spin_thread = None
 
     def reset(self):
         """

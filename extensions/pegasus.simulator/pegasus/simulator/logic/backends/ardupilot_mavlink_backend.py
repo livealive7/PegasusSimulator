@@ -627,6 +627,7 @@ class ArduPilotMavlinkBackend(Backend):
         self._sensor_data = SensorMsg()
 
         self.ap = ArduPilotPlugin(fdm_port_in=9002 + self._vehicle_id * 10)
+        self.ap.isLockStep = self._enable_lockstep
         self.ap.drain_unread_packets()
 
         # Restart the connection

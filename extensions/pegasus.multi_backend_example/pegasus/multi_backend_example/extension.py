@@ -10,9 +10,11 @@
 """
 
 import asyncio
+import time
 from scipy.spatial.transform import Rotation
 
 import carb
+import carb.settings
 import omni.ext
 import omni.ui as ui
 import omni.kit.app
@@ -40,9 +42,20 @@ class MultiBackendExampleExtension(omni.ext.IExt):
     Isaac Sim's extension system calls on_startup() automatically when
     enabled, and on_shutdown() when disabled/reloaded.
     """
+    
+    # 實驗 B: 開啟 RTX ray-tracing motion BVH。Example_Rotary 這類旋轉式 lidar 用 multi-tick
+    # 累積一整圈,而 multi-tick 需要 motion BVH 才「supported」;streaming kit 預設沒帶到這組
+    # 設定,才會有 "Multi-tick is enabled but motion BVH is not active. This is not supported."
+    # 的 warning,並導致整圈被丟(lidar stall)。設 True 在 spawn 前把它打開。
+    # 註:這是 renderer 設定,runtime 設定「通常」會生效,但最保險是寫進 kit 啟動參數
+    # (--/renderer/raytracingMotion/enabled=true 等);若 runtime 設了 warning 仍在,就要改走啟動參數。
+    ENABLE_MOTION_BVH = False
 
     def on_startup(self, ext_id):
         carb.log_warn("[MultiBackendExample] Extension started")
+
+        # 實驗 B: 盡早開啟 motion BVH(在建 lidar 之前)
+        self._apply_motion_bvh()
 
         self._window = ui.Window("Multi Backend Spawner", width=300, height=150)
 
@@ -57,6 +70,29 @@ class MultiBackendExampleExtension(omni.ext.IExt):
                     height=40,
                     clicked_fn=self._on_spawn_button_clicked,
                 )
+                
+    # ------------------------------------------------------------------
+    # 實驗 B: RTX motion BVH
+    # ------------------------------------------------------------------
+    def _apply_motion_bvh(self):
+        """Enable RTX ray-tracing motion BVH so rotary/multi-tick RTX lidars are supported.
+
+        Without this the streaming kit logs "Multi-tick is enabled but motion BVH is not active.
+        This is not supported." and drops whole lidar rotations. These are renderer settings; the
+        robust place is the kit launch args, but setting them here before the lidar/render product
+        is created usually takes effect too.
+        """
+        if not self.ENABLE_MOTION_BVH:
+            return
+        settings = carb.settings.get_settings()
+        settings.set("/rtx/hydra/supportMultiTickRate", True)
+        settings.set_bool("/renderer/raytracingMotion/enabled", True)
+        settings.set_bool("/renderer/raytracingMotion/enableHydraEngineMasking", True)
+        settings.set_string("/renderer/raytracingMotion/enabledForHydraEngines", "0,1,2,3")
+        carb.log_warn(
+            "[MultiBackendExample] motion BVH enabled "
+            f"(/renderer/raytracingMotion/enabled={settings.get('/renderer/raytracingMotion/enabled')})"
+        )
 
     def on_shutdown(self):
         carb.log_warn("[MultiBackendExample] Extension shutting down")
@@ -121,6 +157,10 @@ class MultiBackendExampleExtension(omni.ext.IExt):
         # --- Clean up old vehicles first (ROS2 nodes, ArduPilot SITL process) ---
         self._cleanup_old_vehicles()
 
+        # Re-apply motion BVH before (re)creating the lidar, in case the renderer context
+        # was reset by a previous load_environment / clear_scene.
+        self._apply_motion_bvh()
+
         # --- Load scene, same logic as ui_delegate.py's on_load_scene() ---
         # Fixed to pick scene index 9 here; change to any key in SIMULATION_ENVIRONMENTS as needed
         scene_names = list(SIMULATION_ENVIRONMENTS.keys())
@@ -148,7 +188,7 @@ class MultiBackendExampleExtension(omni.ext.IExt):
             "vehicle_id": 0,
             "ardupilot_autolaunch": False,
             "ardupilot_dir": pg.ardupilot_path,
-            "ardupilot_vehicle_model": pg.ardupilot_default_airframe,
+            "ardupilot_vehicle_model": pg.ardupilot_default_airframe
         })
         ardupilot_backend = ArduPilotMavlinkBackend(config=ardupilot_config)
 
@@ -177,6 +217,10 @@ class MultiBackendExampleExtension(omni.ext.IExt):
         config_multirotor.backends = backends
         config_multirotor.graphical_sensors = [
             MonocularCamera("camera", config={"update_rate": 60.0}),
+            # Lidar("lidar", config={
+            #     "frequency": 10.0,
+            #     "sensor_configuration": "Simple_Example_Solid_State",
+            # })
             Lidar("lidar", config={
                 "frequency": 10.0,
                 "sensor_configuration": "Example_Rotary",

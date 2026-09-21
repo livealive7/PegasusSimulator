@@ -19,7 +19,7 @@ enable_extension("isaacsim.ros2.bridge")
 import rclpy
 from std_msgs.msg import Float64
 from geometry_msgs.msg import TransformStamped
-from sensor_msgs.msg import Imu, MagneticField, NavSatFix, NavSatStatus
+from sensor_msgs.msg import Imu, MagneticField, NavSatFix, NavSatStatus, PointCloud2, PointField
 from geometry_msgs.msg import PoseStamped, TwistStamped, AccelStamped
 
 # TF imports
@@ -33,6 +33,7 @@ except ImportError:
     tf2_ros_loaded = False
 
 from pegasus.simulator.logic.backends.backend import Backend
+from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 
 # Import the replicatore core module used for writing graphical data to ROS 2
 import omni
@@ -443,6 +444,28 @@ class ROS2Backend(Backend):
         # List all the available writers: print(rep.writers.WriterRegistry._writers)
         render_prod_path = data["camera"]._render_product_path
 
+        # Publish a static TF from the vehicle body to this camera's own frame, so RViz/Foxglove
+        # know how to orient the camera frustum/pointcloud in 3D - without it, the frame_id used on
+        # image_raw/depth/points has no known transform at all, so the 3D panel just draws it with
+        # no rotation applied relative to the fixed frame. Since ROS image conventions expect the
+        # "optical frame" (X-right, Y-down, Z-forward), request the pose in that exact convention
+        # via camera_axes="ros" instead of hand-deriving the rotation.
+        if self._pub_tf:
+            cam_position, cam_orientation_wxyz = data["camera"].get_local_pose(camera_axes="ros")
+            t = TransformStamped()
+            t.header.stamp = self.node.get_clock().now().to_msg()
+            t.header.frame_id = self._namespace + '_' + 'base_link'
+            t.child_frame_id = data["camera_name"]
+            t.transform.translation.x = float(cam_position[0])
+            t.transform.translation.y = float(cam_position[1])
+            t.transform.translation.z = float(cam_position[2])
+            # get_local_pose returns a scalar-first (w, x, y, z) quaternion; TransformStamped wants (x, y, z, w)
+            t.transform.rotation.w = float(cam_orientation_wxyz[0])
+            t.transform.rotation.x = float(cam_orientation_wxyz[1])
+            t.transform.rotation.y = float(cam_orientation_wxyz[2])
+            t.transform.rotation.z = float(cam_orientation_wxyz[3])
+            self.tf_static_broadcaster.sendTransform(t)
+
         # Create the writer for the rgb camera
         writer = rep.writers.get("LdrColorSDROS2PublishImage")
         writer.initialize(nodeNamespace=self._namespace + str(self._id), topicName=data["camera_name"] + "/color/image_raw", frameId=data["camera_name"], queueSize=1)
@@ -488,7 +511,9 @@ class ROS2Backend(Backend):
         gate_path = omni.syntheticdata.SyntheticData._get_node_path("PostProcessDispatch" + "IsaacSimulationGate", render_prod_path)
 
         # Set step input of the Isaac Simulation Gate nodes upstream of ROS publishers to control their execution rate
-        og.Controller.attribute(gate_path + ".inputs:step").set(int(60/data["frequency"]))
+        # The gate counts render ticks, so derive the step from the world's actual rendering rate
+        render_hz = 1.0 / PegasusInterface().world.get_rendering_dt()
+        og.Controller.attribute(gate_path + ".inputs:step").set(max(1, round(render_hz / data["frequency"])))
 
     def update_lidar_data(self, data):
 

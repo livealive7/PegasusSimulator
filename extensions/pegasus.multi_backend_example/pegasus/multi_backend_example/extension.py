@@ -159,12 +159,12 @@ class MultiBackendExampleExtension(omni.ext.IExt):
 
         # Re-apply motion BVH before (re)creating the lidar, in case the renderer context
         # was reset by a previous load_environment / clear_scene.
-        self._apply_motion_bvh()
+        # self._apply_motion_bvh()
 
         # --- Load scene, same logic as ui_delegate.py's on_load_scene() ---
         # Fixed to pick scene index 9 here; change to any key in SIMULATION_ENVIRONMENTS as needed
         scene_names = list(SIMULATION_ENVIRONMENTS.keys())
-        selected_scene = scene_names[0]
+        selected_scene = scene_names[9]
 
         pg.set_world_settings(**WORLD_SETTINGS[BACKENDS["ardupilot"]])
         await pg.load_environment_async(
@@ -203,7 +203,7 @@ class MultiBackendExampleExtension(omni.ext.IExt):
                     "pub_sensors": True,
                     "pub_graphical_sensors": True,
                     "pub_state": True,
-                    "pub_tf": False,
+                    "pub_tf": True,
                     "sub_control": True,
                     "state_pub_divisor": 1,
                     "sensor_pub_divisor": 1,
@@ -216,22 +216,25 @@ class MultiBackendExampleExtension(omni.ext.IExt):
         # backends = []
         config_multirotor.backends = backends
         config_multirotor.graphical_sensors = [
-            MonocularCamera("camera", config={"update_rate": 60.0}),
+            MonocularCamera("camera", config={
+                "resolution": (640, 480),
+                "frequency": 30.0,
+            }),
             # Lidar("lidar", config={
             #     "frequency": 10.0,
             #     "sensor_configuration": "Simple_Example_Solid_State",
             # })
-            Lidar("lidar", config={
-                "frequency": 10.0,
-                "sensor_configuration": "Example_Rotary",
-            })
+            # Lidar("lidar", config={
+            #     "frequency": 10.0,
+            #     "sensor_configuration": "Example_Rotary",
+            # })
         ]
 
         Multirotor(
             "/World/quadrotor",
             ROBOTS["Iris"],
             0,
-            (0.0, 0.0, 0.5),
+            (3.0, 0.0, 0.5),
             Rotation.from_euler("XYZ", (0.0, 0.0, 0.0), degrees=True).as_quat(),
             config=config_multirotor,
         )

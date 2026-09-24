@@ -11,6 +11,7 @@
 
 # Make sure the ROS2 extension is enabled
 import threading
+import time
 import carb
 from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.ros2.bridge")
@@ -20,6 +21,7 @@ import rclpy
 from std_msgs.msg import Float64
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import Imu, MagneticField, NavSatFix, NavSatStatus, PointCloud2, PointField
+from rosgraph_msgs.msg import Clock
 from geometry_msgs.msg import PoseStamped, TwistStamped, AccelStamped
 
 # TF imports
@@ -102,6 +104,14 @@ class ROS2Backend(Backend):
         self._pub_state = config.get("pub_state", True)
         self._sub_control = config.get("sub_control", True)
 
+        # Publish /clock from the accumulated physics dt (true simulation time), so ROS2 nodes
+        # running with use_sim_time:=true see a clock consistent with Isaac's own physics step,
+        # instead of each node's own wall-clock time. Off by default - opt-in per vehicle backend
+        # (only one vehicle/backend should publish /clock for a given ROS graph, to avoid two
+        # publishers racing on the same topic).
+        self._pub_clock = config.get("pub_clock", False)
+        self._sim_time_s = 0.0
+
         # Check if the tf2_ros library is loaded and if the flag is set to True
         self._pub_tf = config.get("pub_tf", False) and tf2_ros_loaded
 
@@ -155,7 +165,13 @@ class ROS2Backend(Backend):
     
     def initialize_publishers(self, config: dict):
 
-        # ----------------------------------------------------- 
+        # -----------------------------------------------------
+        # Create the /clock publisher (global topic, not namespaced under this vehicle)
+        # -----------------------------------------------------
+        if self._pub_clock:
+            self.clock_pub = self.node.create_publisher(Clock, "/clock", rclpy.qos.qos_profile_sensor_data)
+
+        # -----------------------------------------------------
         # Create publishers for the state of the vehicle in ENU
         # -----------------------------------------------------
         if self._pub_state:
@@ -558,7 +574,25 @@ class ROS2Backend(Backend):
         calls `rclpy.spin_once()` on its own cadence instead, since polling it synchronously on every physics
         step was measured to cost ~20% of total simulation wall-clock time.
         """
-        pass
+        if self._pub_clock:
+            self._publish_clock(dt)
+
+    def _publish_clock(self, dt: float):
+        """Accumulates the real physics dt into a simulation-time clock and publishes it on /clock.
+
+        This is the actual simulated time (sum of physics steps), not wall-clock time - if the
+        simulation's real-time factor is below 1 (e.g. heavy rendering, camera sensors), /clock
+        advances slower than the wall clock, which is exactly the case use_sim_time is meant to
+        handle: every ROS2 node in the graph that sets use_sim_time:=true will then measure
+        elapsed time (t_cur in traj_server, message_filters sync windows, etc.) against this same
+        simulation time instead of its own wall clock, so a slow-motion sim no longer desyncs a
+        planner's notion of "how far the vehicle has traveled" from where it actually is.
+        """
+        self._sim_time_s += dt
+        msg = Clock()
+        msg.clock.sec = int(self._sim_time_s)
+        msg.clock.nanosec = int((self._sim_time_s - msg.clock.sec) * 1e9)
+        self.clock_pub.publish(msg)
 
     def _spin_loop(self):
         """Background thread target: polls rclpy for incoming messages independently of the physics step."""

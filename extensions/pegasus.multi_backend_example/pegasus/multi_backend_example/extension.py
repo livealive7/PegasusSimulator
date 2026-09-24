@@ -207,6 +207,10 @@ class MultiBackendExampleExtension(omni.ext.IExt):
                     "sub_control": True,
                     "state_pub_divisor": 1,
                     "sensor_pub_divisor": 1,
+                    # Publishes /clock from the accumulated physics dt. Only one vehicle's
+                    # backend should set this True when spawning multiple drones, or their
+                    # /clock publishers will race each other.
+                    "pub_clock": True,
                 },
             )
             backends.append(ros2_backend)
@@ -217,7 +221,7 @@ class MultiBackendExampleExtension(omni.ext.IExt):
         config_multirotor.backends = backends
         config_multirotor.graphical_sensors = [
             MonocularCamera("camera", config={
-                "resolution": (640, 480),
+                "resolution": (320, 240),
                 "frequency": 30.0,
             }),
             # Lidar("lidar", config={

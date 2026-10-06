@@ -23,6 +23,7 @@ from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS, WORLD_SETT
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 from pegasus.simulator.logic.vehicle_manager import VehicleManager
 from pegasus.simulator.logic.backends import ArduPilotMavlinkBackend, ArduPilotMavlinkBackendConfig
+from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
 from pegasus.simulator.logic.graphical_sensors.monocular_camera import MonocularCamera
 from pegasus.simulator.logic.graphical_sensors.lidar import Lidar
@@ -33,6 +34,10 @@ try:
 except ImportError:
     ROS2_AVAILABLE = False
     carb.log_warn("[MultiBackendExample] ROS2 backend not available.")
+
+# Which autopilot backend to spawn -- picked from the dropdown in the
+# extension window, defaulting to this. Valid values: "ardupilot", "px4".
+DEFAULT_BACKEND = "ardupilot"
 
 
 class MultiBackendExampleExtension(omni.ext.IExt):
@@ -57,16 +62,22 @@ class MultiBackendExampleExtension(omni.ext.IExt):
         # 實驗 B: 盡早開啟 motion BVH(在建 lidar 之前)
         self._apply_motion_bvh()
 
-        self._window = ui.Window("Multi Backend Spawner", width=300, height=150)
+        self._window = ui.Window("Multi Backend Spawner", width=300, height=190)
+
+        self._backend_options = ["ardupilot", "px4"]
 
         with self._window.frame:
             with ui.VStack(spacing=8, height=0):
                 ui.Label(
-                    "Spawn a drone with ArduPilot + ROS2 backends",
+                    "Spawn a drone with an autopilot + ROS2 backend",
                     word_wrap=True,
                 )
+                ui.Label("Autopilot backend:")
+                self._backend_combo = ui.ComboBox(
+                    self._backend_options.index(DEFAULT_BACKEND), *self._backend_options
+                )
                 ui.Button(
-                    "Spawn Drone (ArduPilot + ROS2)",
+                    "Spawn Drone",
                     height=40,
                     clicked_fn=self._on_spawn_button_clicked,
                 )
@@ -154,7 +165,10 @@ class MultiBackendExampleExtension(omni.ext.IExt):
     async def _spawn_drone_async(self):
         pg = PegasusInterface()
 
-        # --- Clean up old vehicles first (ROS2 nodes, ArduPilot SITL process) ---
+        backend = self._backend_options[self._backend_combo.model.get_item_value_model().as_int]
+        carb.log_warn(f"[MultiBackendExample] Selected backend: {backend}")
+
+        # --- Clean up old vehicles first (ROS2 nodes, ArduPilot/PX4 SITL process) ---
         self._cleanup_old_vehicles()
 
         # Re-apply motion BVH before (re)creating the lidar, in case the renderer context
@@ -166,7 +180,7 @@ class MultiBackendExampleExtension(omni.ext.IExt):
         scene_names = list(SIMULATION_ENVIRONMENTS.keys())
         selected_scene = scene_names[9]
 
-        pg.set_world_settings(**WORLD_SETTINGS[BACKENDS["ardupilot"]])
+        pg.set_world_settings(**WORLD_SETTINGS[BACKENDS[backend]])
         await pg.load_environment_async(
             SIMULATION_ENVIRONMENTS[selected_scene], force_clear=True
         )
@@ -177,22 +191,28 @@ class MultiBackendExampleExtension(omni.ext.IExt):
         #     internally, which invalidates the pg.world Python reference.
         #     Must re-fetch the latest world from PegasusInterface() -
         #     can't reuse the old pg variable's world reference ---
-        pg = PegasusInterface()
 
         # Make sure the physics context is initialized
         if hasattr(pg.world, "_physics_context") is False:
             await pg.world.initialize_simulation_context_async()
 
-        # --- Backend 1: ArduPilot SITL ---
-        ardupilot_config = ArduPilotMavlinkBackendConfig({
-            "vehicle_id": 0,
-            "ardupilot_autolaunch": False,
-            "ardupilot_dir": pg.ardupilot_path,
-            "ardupilot_vehicle_model": pg.ardupilot_default_airframe
-        })
-        ardupilot_backend = ArduPilotMavlinkBackend(config=ardupilot_config)
-
-        backends = [ardupilot_backend]
+        # --- Backend 1: autopilot SITL (ArduPilot or PX4, per the dropdown) ---
+        if backend == "ardupilot":
+            ardupilot_config = ArduPilotMavlinkBackendConfig({
+                "vehicle_id": 0,
+                "ardupilot_autolaunch": False,
+                "ardupilot_dir": pg.ardupilot_path,
+                "ardupilot_vehicle_model": pg.ardupilot_default_airframe,
+            })
+            backends = [ArduPilotMavlinkBackend(config=ardupilot_config)]
+        else:
+            mavlink_config = PX4MavlinkBackendConfig({
+                "vehicle_id": 0,
+                "px4_autolaunch": False,
+                "px4_dir": pg.px4_path,
+                "px4_vehicle_model": pg.px4_default_airframe # CHANGE this line to 'iris' if using PX4 version bellow v1.14
+            })
+            backends = [PX4MavlinkBackend(config=mavlink_config)]
 
         # --- Backend 2: ROS2 ---
         if ROS2_AVAILABLE:

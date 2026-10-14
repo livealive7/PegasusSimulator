@@ -2,8 +2,20 @@
 """
 | File: 12_multi_backend_standalone.py
 | Description: Standalone-app port of the `pegasus.multi_backend_example` Isaac Sim extension.
-| Spawns a Multirotor with both an ArduPilot SITL backend and a ROS2 backend (RGB + colorized
-| RGBD pointcloud), without needing to open Isaac Sim's UI and click a button.
+| Spawns a Multirotor with a PX4 SITL backend (default; ArduPilot with --backend ardupilot) and a
+| ROS2 backend (RGB + depth), without needing to open Isaac Sim's UI and click a button. Also
+| starts the NavRL goal display (spheres + scene grid export), like the extension does.
+|
+| PX4 is not launched from here (px4_autolaunch is False): start it first, e.g. with
+| ~/run_px4.sh or `ros2 launch isaac_nav navrl_stack.launch.py` (NavRL repo), then run this.
+| Restart PX4 every time this script (or the extension's scene) is started again.
+|
+| From the host, inside the Isaac Sim container (needs root and the ROS2/DDS environment of the
+| streaming app, otherwise the ROS2 topics never reach the host):
+|   docker exec -u root -e HOME=/root -e ROS_DISTRO=jazzy \
+|     -e LD_LIBRARY_PATH=/isaac-sim/exts/isaacsim.ros2.core/jazzy/lib \
+|     -e FASTRTPS_DEFAULT_PROFILES_FILE=/root/.ros/fastdds.xml isim-peterson-isaac-sim-1 \
+|     /isaac-sim/python.sh /Volume/PegasusSimulator/examples/12_multi_backend_standalone.py --headless
 |
 | Run headless (no GUI, for a remote/server box) with:
 |   ./python.sh examples/12_multi_backend_standalone.py --headless
@@ -14,7 +26,7 @@
 
 import argparse
 
-parser = argparse.ArgumentParser(description="Spawn a drone with ArduPilot + ROS2 backends")
+parser = argparse.ArgumentParser(description="Spawn a drone with a PX4 (or ArduPilot) + ROS2 backend")
 parser.add_argument("--headless", action="store_true", help="Run without the Isaac Sim GUI")
 parser.add_argument("--scene-index", type=int, default=9, help="Index into SIMULATION_ENVIRONMENTS to load")
 parser.add_argument("--enable-motion-bvh", action="store_true",
@@ -23,13 +35,16 @@ parser.add_argument("--duration", type=float, default=None,
                      help="Auto-close after this many seconds of wall-clock time (for scripted FPS/RTF benchmarks)")
 parser.add_argument("--fps-log-interval", type=float, default=1.0,
                      help="How often (wall-clock seconds) to log the current FPS/RTF")
-parser.add_argument("--skip-ardupilot", action="store_true",
-                     help="Don't attach the ArduPilot backend (it autolaunches SITL via gnome-terminal, "
-                          "which isn't available in a headless/server container and will hang the sim "
-                          "waiting for a heartbeat that never arrives - useful for pure FPS/RTF benchmarks)")
+parser.add_argument("--backend", choices=["px4", "ardupilot"], default="px4",
+                     help="Autopilot backend to attach (same choice as the extension's dropdown)")
+parser.add_argument("--skip-autopilot", "--skip-ardupilot", dest="skip_autopilot", action="store_true",
+                     help="Don't attach the autopilot backend (the sim would otherwise wait for a "
+                          "heartbeat from a SITL that is not running - useful for pure FPS/RTF benchmarks)")
+parser.add_argument("--no-goal-display", action="store_true",
+                     help="Don't start the NavRL goal display (goal spheres + scene grid export)")
 parser.add_argument("--skip-ros2", action="store_true",
                      help="Don't attach the ROS2 backend (isolates whether its background "
-                          "rclpy.spin_once() thread contends for the GIL with the ArduPilot "
+                          "rclpy.spin_once() thread contends for the GIL with the autopilot "
                           "backend's own update(), for debugging GPS/MAVLink timing)")
 parser.add_argument("--cam-res", type=str, default="320x240", help="Camera resolution WxH")
 parser.add_argument("--cam-freq", type=float, default=30.0, help="Camera frequency (Hz)")
@@ -57,6 +72,7 @@ import carb
 import carb.settings
 from isaacsim import SimulationApp
 
+import importlib.util
 import os
 
 # Start Isaac Sim's simulation environment
@@ -87,6 +103,7 @@ from scipy.spatial.transform import Rotation
 from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS, WORLD_SETTINGS, BACKENDS
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 from pegasus.simulator.logic.backends import ArduPilotMavlinkBackend, ArduPilotMavlinkBackendConfig
+from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
 from pegasus.simulator.logic.graphical_sensors.monocular_camera import MonocularCamera
 
@@ -131,11 +148,34 @@ except ImportError:
     carb.log_warn("[MultiBackendStandalone] ROS2 backend not available.")
 
 
+# NavRL goal display (spheres for the goals of isaac_nav's goal_manager_node + scene grid export).
+# The path is the container view of ~/Volume; override with NAVRL_GOAL_DISPLAY.
+GOAL_DISPLAY_PATH = os.environ.get(
+    "NAVRL_GOAL_DISPLAY",
+    "/Volume/NavRL/ros2/src/isaac_nav/isaac_scripts/goal_display.py")
+
+
 class PegasusApp:
     """
-    Standalone app that spawns a Multirotor with an ArduPilot SITL backend and a ROS2 backend
-    (RGB image + colorized RGBD pointcloud), mirroring the pegasus.multi_backend_example extension.
+    Standalone app that spawns a Multirotor with a PX4 SITL backend (or ArduPilot) and a ROS2 backend
+    (RGB image + depth), mirroring the pegasus.multi_backend_example extension.
     """
+
+    def _start_goal_display(self):
+        self._goal_display_module = None
+        if args.no_goal_display:
+            return
+        if not os.path.isfile(GOAL_DISPLAY_PATH):
+            carb.log_warn(f"[MultiBackendStandalone] No goal display at {GOAL_DISPLAY_PATH}, skipping")
+            return
+        try:
+            spec = importlib.util.spec_from_file_location("navrl_goal_display", GOAL_DISPLAY_PATH)
+            self._goal_display_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self._goal_display_module)
+            self._goal_display_module.start()
+        except Exception as e:  # never let an optional helper break the spawner
+            self._goal_display_module = None
+            carb.log_warn(f"[MultiBackendStandalone] Goal display failed to start: {e}")
 
     def __init__(self):
         # Acquire the timeline that will be used to start/stop the simulation
@@ -144,11 +184,14 @@ class PegasusApp:
         # Start the Pegasus Interface
         self.pg = PegasusInterface()
 
+        # NavRL goal display (listens on UDP 9870, exports the scene grid once the scene runs)
+        self._start_goal_display()
+
         # Optionally enable RTX motion BVH before any lidar/render product is created
         # self._apply_motion_bvh()
 
-        # Apply the world settings used for the ArduPilot/PX4 backends and load the world
-        world_settings = dict(WORLD_SETTINGS[BACKENDS["ardupilot"]])
+        # Apply the world settings used for the selected autopilot backend and load the world
+        world_settings = dict(WORLD_SETTINGS[BACKENDS[args.backend]])
         if args.render_hz:
             world_settings["rendering_dt"] = 1.0 / args.render_hz
         self.pg.set_world_settings(**world_settings)
@@ -161,17 +204,28 @@ class PegasusApp:
         self.pg.load_environment(SIMULATION_ENVIRONMENTS[selected_scene])
         carb.log_warn(f"[MultiBackendStandalone] Scene loaded: {selected_scene}")
 
-        # --- Backend 1: ArduPilot SITL ---
+        # --- Backend 1: autopilot SITL (PX4 by default, ArduPilot with --backend ardupilot) ---
         backends = []
-        if not args.skip_ardupilot:
-            ardupilot_config = ArduPilotMavlinkBackendConfig({
-                "vehicle_id": 0,
-                "ardupilot_autolaunch": False,
-                "ardupilot_dir": self.pg.ardupilot_path,
-                "ardupilot_vehicle_model": self.pg.ardupilot_default_airframe,
-                "enable_lockstep": True,
-            })
-            backends.append(ArduPilotMavlinkBackend(config=ardupilot_config))
+        if not args.skip_autopilot:
+            if args.backend == "ardupilot":
+                ardupilot_config = ArduPilotMavlinkBackendConfig({
+                    "vehicle_id": 0,
+                    "ardupilot_autolaunch": False,
+                    "ardupilot_dir": self.pg.ardupilot_path,
+                    "ardupilot_vehicle_model": self.pg.ardupilot_default_airframe,
+                    "enable_lockstep": True,
+                })
+                backends.append(ArduPilotMavlinkBackend(config=ardupilot_config))
+            else:
+                # PX4 SITL is started separately (run_px4.sh, "none_iris" target): it waits for
+                # this simulator on TCP 4560.
+                px4_config = PX4MavlinkBackendConfig({
+                    "vehicle_id": 0,
+                    "px4_autolaunch": False,
+                    "px4_dir": self.pg.px4_path,
+                    "px4_vehicle_model": self.pg.px4_default_airframe,
+                })
+                backends.append(PX4MavlinkBackend(config=px4_config))
 
         # --- Backend 2: ROS2 ---
         if ROS2_AVAILABLE and not args.skip_ros2:
@@ -186,6 +240,8 @@ class PegasusApp:
                     "sub_control": True,
                     "state_pub_divisor": args.state_div,
                     "sensor_pub_divisor": args.sensor_div,
+                    # Publishes /clock from the accumulated physics dt. Only one vehicle's
+                    # backend should set this True when spawning multiple drones.
                     "pub_clock": True,
                 },
             ))
@@ -315,6 +371,8 @@ class PegasusApp:
 
         # Cleanup and stop
         carb.log_warn("[MultiBackendStandalone] Simulation App is closing.")
+        if self._goal_display_module is not None:
+            self._goal_display_module.stop()
         self.timeline.stop()
         simulation_app.close()
 

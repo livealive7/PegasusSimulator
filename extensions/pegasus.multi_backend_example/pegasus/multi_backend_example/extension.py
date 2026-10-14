@@ -10,6 +10,8 @@
 """
 
 import asyncio
+import importlib.util
+import os
 import time
 from scipy.spatial.transform import Rotation
 
@@ -56,8 +58,29 @@ class MultiBackendExampleExtension(omni.ext.IExt):
     # (--/renderer/raytracingMotion/enabled=true 等);若 runtime 設了 warning 仍在,就要改走啟動參數。
     ENABLE_MOTION_BVH = False
 
+    # NavRL goal display (spheres for the goals of isaac_nav's goal_manager_node).
+    # The path is the container view of ~/Volume; override with NAVRL_GOAL_DISPLAY.
+    GOAL_DISPLAY_PATH = os.environ.get(
+        "NAVRL_GOAL_DISPLAY",
+        "/Volume/NavRL/ros2/src/isaac_nav/isaac_scripts/goal_display.py")
+
+    def _start_goal_display(self):
+        if not os.path.isfile(self.GOAL_DISPLAY_PATH):
+            carb.log_warn(f"[MultiBackendExample] No goal display at {self.GOAL_DISPLAY_PATH}, skipping")
+            return
+        try:
+            spec = importlib.util.spec_from_file_location("navrl_goal_display", self.GOAL_DISPLAY_PATH)
+            self._goal_display_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self._goal_display_module)
+            self._goal_display_module.start()
+        except Exception as e:  # never let an optional helper break the spawner
+            self._goal_display_module = None
+            carb.log_warn(f"[MultiBackendExample] Goal display failed to start: {e}")
+
     def on_startup(self, ext_id):
         carb.log_warn("[MultiBackendExample] Extension started")
+        self._goal_display_module = None
+        self._start_goal_display()
 
         # 實驗 B: 盡早開啟 motion BVH(在建 lidar 之前)
         self._apply_motion_bvh()
@@ -107,6 +130,8 @@ class MultiBackendExampleExtension(omni.ext.IExt):
 
     def on_shutdown(self):
         carb.log_warn("[MultiBackendExample] Extension shutting down")
+        if getattr(self, "_goal_display_module", None) is not None:
+            self._goal_display_module.stop()
         self._window = None
         self._cleanup_old_vehicles()
         try:
